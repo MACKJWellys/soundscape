@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#0A0D14" />
+<title>Soundscape</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>" />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Azeret+Mono:wght@300;400&display=swap" rel="stylesheet" />
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body,#root{width:100%;height:100%;overflow:hidden;background:#0A0D14}
+body{-webkit-tap-highlight-color:transparent}
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://unpkg.com/tone@14/build/Tone.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useRef,useCallback}=React;
+
+const PENTA=[130.81,146.83,164.81,196,220,261.63,293.66,329.63,392,440,523.25,587.33,659.25,783.99,880,1046.5,1174.66,1318.51,1567.98,1760];
+const NOTE_GRP=[0,1,2,3,4,0,1,2,3,4,0,1,2,3,4,0,1,2,3,4];
+
+function makeDelay(ctx,time,fb,lpFreq){
+  const d=ctx.createDelay(3);d.delayTime.value=time;
+  const g=ctx.createGain();g.gain.value=fb;
+  const f=ctx.createBiquadFilter();f.type="lowpass";f.frequency.value=lpFreq;
+  const inp=ctx.createGain();inp.gain.value=1;
+  const out=ctx.createGain();out.gain.value=1;
+  inp.connect(d);d.connect(out);d.connect(f);f.connect(g);g.connect(d);
+  return{inp,out,delay:d,fbGain:g,fbFilter:f};
+}
+
+function makeStars(n){const s=[];let seed=77;const r=()=>{seed=(seed*16807)%2147483647;return seed/2147483647};for(let i=0;i<n;i++)s.push({x:r(),y:r(),s:.3+r()*1.6,sp:.2+r()*1.8,ph:r()*Math.PI*2});return s}
+const STARS=makeStars(90);
+
+const MODES={
+  lucid:{name:"Lucid",sub:"The world becomes music",accent:"#D4A574",accentRGB:"212,165,116",bgA:"#0A0D14",bgB:"#14120E"},
+  liminal:{name:"Liminal",sub:"Time dissolves around you",accent:"#7B9DB8",accentRGB:"123,157,184",bgA:"#060D1A",bgB:"#0A0E18"},
+};
+
+function Soundscape(){
+  const[started,setStarted]=useState(false);
+  const[mode,setMode]=useState("lucid");
+  const[loading,setLoading]=useState(false);
+  const[error,setError]=useState(null);
+  const[showUI,setShowUI]=useState(true);
+  const[energy,setEnergy]=useState(0);
+
+  const canvasRef=useRef(null),animRef=useRef(null),micRef=useRef(null),streamRef=useRef(null);
+  const engineRef=useRef(null),sharedRef=useRef(null);
+  const tRef=useRef(0),energyRef=useRef(0),modeRef=useRef("lucid");
+
+  useEffect(()=>{modeRef.current=mode},[mode]);
+
+  const buildShared=useCallback((rawCtx)=>{
+    const hpf=rawCtx.createBiquadFilter();hpf.type="highpass";hpf.frequency.value=75;hpf.Q.value=.5;
+    const comp=rawCtx.createDynamicsCompressor();comp.threshold.value=-24;comp.ratio.value=3;comp.attack.value=.003;comp.release.value=.15;
+    const analyser=rawCtx.createAnalyser();analyser.fftSize=512;analyser.smoothingTimeConstant=.75;
+    const masterGain=rawCtx.createGain();masterGain.gain.value=.85;
+    const limiter=rawCtx.createDynamicsCompressor();limiter.threshold.value=-3;limiter.ratio.value=20;limiter.attack.value=.001;limiter.release.value=.05;
+    masterGain.connect(analyser);masterGain.connect(limiter);limiter.connect(rawCtx.destination);
+    return{hpf,comp,analyser,masterGain,limiter,fftData:new Float32Array(analyser.frequencyBinCount),waveData:new Float32Array(analyser.fftSize)};
+  },[]);
+
+  const buildLucid=useCallback((rawCtx,inputNode,outputNode)=>{
+    const resoSum=rawCtx.createGain();resoSum.gain.value=1;
+    const resonators=PENTA.map((freq,i)=>{
+      const bp=rawCtx.createBiquadFilter();bp.type="bandpass";bp.frequency.value=freq;bp.Q.value=14+(i/PENTA.length)*12;
+      const g=rawCtx.createGain();g.gain.value=i<5?.08:i<10?.065:i<15?.05:.04;
+      inputNode.connect(bp);bp.connect(g);g.connect(resoSum);
+      return{filter:bp,gain:g,baseGain:g.gain.value};
+    });
+
+    const chorus=new Tone.Chorus({frequency:.8,delayTime:3.5,depth:.6,wet:.35});chorus.start();
+    const dl1=makeDelay(rawCtx,.375,.32,3500),dl2=makeDelay(rawCtx,.5,.28,2800),dl3=makeDelay(rawCtx,.75,.24,2200);
+    const reverb=new Tone.Freeverb({roomSize:.78,dampening:3200,wet:.5});
+
+    const dryGain=rawCtx.createGain();dryGain.gain.value=.025;inputNode.connect(dryGain);dryGain.connect(outputNode);
+
+    const bridgeIn=Tone.getContext().createGain();resoSum.connect(bridgeIn);
+    const toneInput=new Tone.Gain(1);Tone.connect(bridgeIn,toneInput);toneInput.connect(chorus);
+    const chorusOut=rawCtx.createGain();chorusOut.gain.value=1;Tone.connect(chorus,chorusOut);
+
+    const delaySum=rawCtx.createGain();delaySum.gain.value=.7;
+    chorusOut.connect(dl1.inp);dl1.out.connect(delaySum);
+    chorusOut.connect(dl2.inp);dl2.out.connect(delaySum);
+    chorusOut.connect(dl3.inp);dl3.out.connect(delaySum);
+
+    const directGain=rawCtx.createGain();directGain.gain.value=.55;
+    chorusOut.connect(directGain);directGain.connect(delaySum);
+
+    const reverbBridge=new Tone.Gain(1);Tone.connect(delaySum,reverbBridge);reverbBridge.connect(reverb);Tone.connect(reverb,outputNode);
+
+    return{
+      resonators,resoSum,chorus,toneInput,bridgeIn,delays:[dl1,dl2,dl3],directGain,delaySum,reverb,reverbBridge,dryGain,chorusOut,
+      update(t){
+        const lfo1=Math.sin(t*.037*Math.PI*2),lfo2=Math.sin(t*.023*Math.PI*2),lfo3=Math.sin(t*.011*Math.PI*2);
+        const weights=[.55+.45*Math.sin(t*.031*Math.PI*2),.55+.45*Math.sin(t*.031*Math.PI*2+1.26),.55+.45*Math.sin(t*.019*Math.PI*2+.4),.55+.45*Math.sin(t*.019*Math.PI*2+2.51),.55+.45*Math.sin(t*.013*Math.PI*2+1.8)];
+        const octaveTilt=.5+.5*lfo3;
+        const octW=[1.2-octaveTilt*.5,1,.8+octaveTilt*.4,.6+octaveTilt*.6];
+        const ct=rawCtx.currentTime;
+        for(let i=0;i<resonators.length;i++){
+          const target=resonators[i].baseGain*weights[NOTE_GRP[i]]*octW[Math.floor(i/5)];
+          resonators[i].gain.gain.setTargetAtTime(target,ct,.15);
+        }
+        dl1.fbGain.gain.setTargetAtTime(.30+lfo1*.06,ct,.3);
+        dl2.fbGain.gain.setTargetAtTime(.26+lfo2*.05,ct,.3);
+        dl3.fbGain.gain.setTargetAtTime(.22+lfo3*.05,ct,.3);
+        dl1.fbFilter.frequency.setTargetAtTime(3000+lfo2*800,ct,.5);
+      },
+      cleanup(){
+        resonators.forEach(r=>{try{r.filter.disconnect();r.gain.disconnect()}catch(e){}});
+        [dl1,dl2,dl3].forEach(d=>{try{d.inp.disconnect();d.out.disconnect();d.delay.disconnect();d.fbGain.disconnect();d.fbFilter.disconnect()}catch(e){}});
+        try{resoSum.disconnect();bridgeIn.disconnect();chorusOut.disconnect();directGain.disconnect();delaySum.disconnect();dryGain.disconnect()}catch(e){}
+        [chorus,toneInput,reverbBridge,reverb].forEach(n=>{try{n.dispose()}catch(e){}});
+      },
+    };
+  },[]);
+
+  const buildLiminal=useCallback((rawCtx,inputNode,outputNode)=>{
+    const inputLP=rawCtx.createBiquadFilter();inputLP.type="lowpass";inputLP.frequency.value=3000;inputLP.Q.value=.4;
+    inputNode.connect(inputLP);
+    const dlLong=makeDelay(rawCtx,1.15,.42,1400),dlShort=makeDelay(rawCtx,.43,.35,2200);
+    inputLP.connect(dlLong.inp);inputLP.connect(dlShort.inp);
+    const delayMix=rawCtx.createGain();delayMix.gain.value=.8;dlLong.out.connect(delayMix);
+    const shortMix=rawCtx.createGain();shortMix.gain.value=.55;dlShort.out.connect(shortMix);shortMix.connect(delayMix);
+    const phaser=new Tone.Phaser({frequency:.12,octaves:2.5,baseFrequency:600,wet:.4});
+    const reverb=new Tone.Freeverb({roomSize:.93,dampening:1800,wet:.6});
+    const dryGain=rawCtx.createGain();dryGain.gain.value=.03;inputNode.connect(dryGain);dryGain.connect(outputNode);
+    const bridge=new Tone.Gain(1);Tone.connect(delayMix,bridge);bridge.connect(phaser);phaser.connect(reverb);Tone.connect(reverb,outputNode);
+    return{
+      inputLP,dlLong,dlShort,delayMix,shortMix,phaser,reverb,bridge,dryGain,
+      update(t){
+        const lfo1=Math.sin(t*.029*Math.PI*2),lfo2=Math.sin(t*.017*Math.PI*2),ct=rawCtx.currentTime;
+        dlLong.fbGain.gain.setTargetAtTime(.40+lfo1*.06,ct,.4);
+        dlLong.fbFilter.frequency.setTargetAtTime(1200+lfo2*400,ct,.5);
+        shortMix.gain.setTargetAtTime(.45+lfo1*.15,ct,.3);
+        inputLP.frequency.setTargetAtTime(2500+lfo2*800,ct,.5);
+      },
+      cleanup(){
+        [dlLong,dlShort].forEach(d=>{try{d.inp.disconnect();d.out.disconnect();d.delay.disconnect();d.fbGain.disconnect();d.fbFilter.disconnect()}catch(e){}});
+        try{inputLP.disconnect();delayMix.disconnect();shortMix.disconnect();dryGain.disconnect()}catch(e){}
+        [phaser,reverb,bridge].forEach(n=>{try{n.dispose()}catch(e){}});
+      },
+    };
+  },[]);
+
+  const startAudio=useCallback(async()=>{
+    setLoading(true);setError(null);
+    try{
+      await Tone.start();Tone.getDestination().volume.value=-60;
+      const rawCtx=Tone.getContext().rawContext;
+      const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      streamRef.current=stream;
+      const micSrc=rawCtx.createMediaStreamSource(stream);micRef.current=micSrc;
+      const shared=buildShared(rawCtx);sharedRef.current=shared;
+      micSrc.connect(shared.hpf);shared.hpf.connect(shared.comp);
+      const builder=modeRef.current==="lucid"?buildLucid:buildLiminal;
+      engineRef.current=builder(rawCtx,shared.comp,shared.masterGain);
+      setStarted(true);
+    }catch(err){
+      const m=err.message||"";
+      setError(m.includes("Permission")||m.includes("NotAllowed")?"Microphone access needed.":"Could not start: "+m);
+    }
+    setLoading(false);
+  },[buildShared,buildLucid,buildLiminal]);
+
+  const stopAudio=useCallback(()=>{
+    if(animRef.current)cancelAnimationFrame(animRef.current);
+    if(engineRef.current){engineRef.current.cleanup();engineRef.current=null}
+    const s=sharedRef.current;
+    if(s){try{s.hpf.disconnect();s.comp.disconnect();s.masterGain.disconnect();s.limiter.disconnect();s.analyser.disconnect()}catch(e){}sharedRef.current=null}
+    if(micRef.current){try{micRef.current.disconnect()}catch(e){}micRef.current=null}
+    if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null}
+    setStarted(false);
+  },[]);
+
+  const switchMode=useCallback((newMode)=>{
+    if(!started||newMode===modeRef.current)return;
+    setMode(newMode);
+    const rawCtx=Tone.getContext().rawContext;const s=sharedRef.current;if(!s)return;
+    s.masterGain.gain.setTargetAtTime(0,rawCtx.currentTime,.15);
+    setTimeout(()=>{
+      if(engineRef.current)engineRef.current.cleanup();
+      const builder=newMode==="lucid"?buildLucid:buildLiminal;
+      engineRef.current=builder(rawCtx,s.comp,s.masterGain);
+      s.masterGain.gain.setTargetAtTime(.85,rawCtx.currentTime,.3);
+    },350);
+  },[started,buildLucid,buildLiminal]);
+
+  useEffect(()=>{
+    if(!started)return;
+    const canvas=canvasRef.current;if(!canvas)return;
+    const ctx=canvas.getContext("2d");
+    const resize=()=>{const dpr=window.devicePixelRatio||1,r=canvas.getBoundingClientRect();canvas.width=r.width*dpr;canvas.height=r.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0)};
+    resize();window.addEventListener("resize",resize);
+
+    const draw=()=>{
+      animRef.current=requestAnimationFrame(draw);
+      const s=sharedRef.current,eng=engineRef.current;if(!s||!eng)return;
+      const rect=canvas.getBoundingClientRect(),w=rect.width,h=rect.height;
+      tRef.current+=.016;const t=tRef.current;const m=modeRef.current;const md=MODES[m];
+
+      eng.update(t);
+
+      s.analyser.getFloatTimeDomainData(s.waveData);
+      let sum=0;for(let i=0;i<s.waveData.length;i++)sum+=s.waveData[i]*s.waveData[i];
+      energyRef.current+=(Math.sqrt(sum/s.waveData.length)-energyRef.current)*.08;
+      const en=Math.min(1,energyRef.current*4);setEnergy(en);
+
+      s.analyser.getFloatFrequencyData(s.fftData);
+
+      ctx.fillStyle=md.bgA;ctx.fillRect(0,0,w,h);
+      const bgGrad=ctx.createRadialGradient(w*.5,h*.4,0,w*.5,h*.4,Math.max(w,h)*.7);
+      bgGrad.addColorStop(0,md.bgB+"40");bgGrad.addColorStop(1,"transparent");
+      ctx.fillStyle=bgGrad;ctx.fillRect(0,0,w,h);
+
+      for(const star of STARS){ctx.globalAlpha=(.3+.4*Math.sin(t*star.sp+star.ph)+en*.3)*.5;ctx.fillStyle=m==="lucid"?"#E8D5C0":"#C0D0E0";ctx.beginPath();ctx.arc(star.x*w,star.y*h,star.s*(.8+en*.4),0,Math.PI*2);ctx.fill()}
+      ctx.globalAlpha=1;
+
+      const cx=w/2,cy=h*.42,baseR=Math.min(w,h)*.15;
+
+      if(m==="lucid"){
+        for(let b=0;b<6;b++){
+          const bandY=cy-baseR*.8+(b/6)*baseR*2.2;
+          const amp=8+en*25+Math.sin(t*.3+b*.9)*5;
+          const hue=(30+b*12+Math.sin(t*.02+b)*15)%360;
+          ctx.beginPath();
+          for(let x=0;x<=w;x+=3){const y=bandY+Math.sin(x*.008+t*.25+b*1.3)*amp+Math.sin(x*.015+t*.18+b*2.1)*amp*.4+Math.sin(x*.003+t*.08)*amp*.6;x===0?ctx.moveTo(x,y):ctx.lineTo(x,y)}
+          for(let x=w;x>=0;x-=3){const y=bandY+12+Math.sin(x*.008+t*.25+b*1.3+.5)*amp+Math.sin(x*.015+t*.18+b*2.1+.3)*amp*.4+Math.sin(x*.003+t*.08+1)*amp*.6;ctx.lineTo(x,y)}
+          ctx.closePath();ctx.fillStyle="hsla("+hue+","+(40+en*30)+"%,"+(45+en*20)+"%,"+(0.04+en*.06)+")";ctx.fill();
+        }
+        const glowR=baseR*(.8+en*.6);const glow=ctx.createRadialGradient(cx,cy,0,cx,cy,glowR);
+        glow.addColorStop(0,"rgba("+md.accentRGB+","+(0.08+en*.12)+")");glow.addColorStop(.5,"rgba("+md.accentRGB+","+(0.02+en*.04)+")");glow.addColorStop(1,"transparent");
+        ctx.fillStyle=glow;ctx.fillRect(cx-glowR,cy-glowR,glowR*2,glowR*2);
+
+        for(let i=0;i<20;i++){
+          const fftBin=Math.floor((PENTA[i]/2000)*s.fftData.length);
+          const activity=Math.max(0,((s.fftData[Math.min(fftBin,s.fftData.length-1)]||(-100))+80)/80);
+          if(activity<.05)continue;
+          const angle=(i/20)*Math.PI*2+t*.05+Math.sin(t*.013+i)*.3;
+          const orbit=baseR*(.7+(i%5)*.15)+activity*20;
+          ctx.beginPath();ctx.arc(cx+Math.cos(angle)*orbit,cy+Math.sin(angle)*orbit,1.5+activity*4,0,Math.PI*2);
+          ctx.fillStyle="rgba("+md.accentRGB+","+activity*.7+")";ctx.shadowBlur=activity*15;ctx.shadowColor=md.accent;ctx.fill();
+        }
+        ctx.shadowBlur=0;
+      }else{
+        for(let r=0;r<12;r++){
+          const phase=(t*.08+r/12)%1;const radius=baseR*.3+phase*baseR*2.5;
+          const alpha=(1-phase)*(.06+en*.12);if(alpha<.01)continue;
+          ctx.beginPath();
+          for(let i=0;i<=80;i++){const a=(i/80)*Math.PI*2;const wobble=Math.sin(a*3+t*.4+r)*3*en+Math.sin(a*5+t*.2+r*2)*2*en;const rr=radius+wobble;ctx.lineTo(cx+Math.cos(a)*rr,cy+Math.sin(a)*rr)}
+          ctx.closePath();ctx.strokeStyle="rgba("+md.accentRGB+","+alpha+")";ctx.lineWidth=1+en*.5;ctx.stroke();
+        }
+        const glowR=baseR*(.4+en*.5);const glow=ctx.createRadialGradient(cx,cy,0,cx,cy,glowR);
+        glow.addColorStop(0,"rgba("+md.accentRGB+","+(0.06+en*.1)+")");glow.addColorStop(.6,"rgba("+md.accentRGB+","+(0.02+en*.03)+")");glow.addColorStop(1,"transparent");
+        ctx.fillStyle=glow;ctx.beginPath();ctx.arc(cx,cy,glowR,0,Math.PI*2);ctx.fill();
+
+        for(let i=0;i<15;i++){
+          const angle=t*.02*(i%2===0?1:-1)+i*.43;const orbit=baseR*(.5+Math.sin(t*.01+i*1.7)*.4)+i*8;
+          ctx.beginPath();ctx.arc(cx+Math.cos(angle)*orbit,cy+Math.sin(angle)*orbit,.8+en*1.5,0,Math.PI*2);
+          ctx.fillStyle="rgba("+md.accentRGB+","+Math.max(0,.1+en*.25+Math.sin(t*.5+i*2.3)*.08)+")";ctx.fill();
+        }
+      }
+
+      const vig=ctx.createRadialGradient(cx,h*.45,Math.min(w,h)*.25,cx,h*.45,Math.max(w,h)*.8);
+      vig.addColorStop(0,"transparent");vig.addColorStop(1,"rgba(0,0,0,0.5)");ctx.fillStyle=vig;ctx.fillRect(0,0,w,h);
+    };
+    draw();
+    return()=>{cancelAnimationFrame(animRef.current);window.removeEventListener("resize",resize)};
+  },[started]);
+
+  useEffect(()=>()=>stopAudio(),[stopAudio]);
+
+  const md=MODES[mode];
+
+  if(!started){return(
+    <div style={S.root}>
+      <div style={S.landing}>
+        <div style={{marginBottom:56}}>
+          <div style={S.tag}>REAL-TIME AUDIO</div>
+          <h1 style={S.title}>Soundscape</h1>
+          <p style={S.desc}>Your environment, resynthesized. Put on headphones and the world around you becomes a new sonic experience — ambient, musical, and endlessly evolving.</p>
+        </div>
+        <div style={{display:"flex",gap:12,marginBottom:48}}>
+          {Object.entries(MODES).map(([k,v])=>(
+            <button key={k} onClick={()=>setMode(k)} style={{...S.modePill,borderColor:mode===k?v.accent:"rgba(255,255,255,0.08)",background:mode===k?v.accent+"18":"rgba(255,255,255,0.03)",color:mode===k?v.accent:"#667"}}>
+              <div style={{width:6,height:6,borderRadius:"50%",background:mode===k?v.accent:"#444",marginBottom:5}} />
+              <div style={{fontSize:11,letterSpacing:1.5}}>{v.name.toUpperCase()}</div>
+              <div style={{fontSize:9,color:mode===k?v.accent+"AA":"#445",marginTop:3,letterSpacing:.5}}>{v.sub}</div>
+            </button>
+          ))}
+        </div>
+        {error&&<p style={S.error}>{error}</p>}
+        <button onClick={startAudio} disabled={loading} style={{...S.beginBtn,opacity:loading?.5:1}}>{loading?"Listening...":"Begin"}</button>
+        <p style={S.note}>🎧 Headphones required</p>
+      </div>
+    </div>)}
+
+  return(
+    <div style={S.root} onClick={()=>setShowUI(u=>!u)}>
+      <canvas ref={canvasRef} style={S.canvas} />
+      <div style={{...S.modeLabel,opacity:showUI?1:0}}>
+        <div style={{fontSize:9,letterSpacing:3,color:md.accent,marginBottom:3,fontFamily:"'Azeret Mono',monospace"}}>MODE</div>
+        <div style={{fontFamily:"'Instrument Serif',serif",fontSize:26,color:"#E8E4DE"}}>{md.name}</div>
+        <div style={{fontSize:10,color:"#667",marginTop:2,fontFamily:"'Azeret Mono',monospace"}}>{md.sub}</div>
+      </div>
+      <div style={{...S.controls,opacity:showUI?1:0,transform:showUI?"none":"translateY(16px)",pointerEvents:showUI?"auto":"none"}}>
+        <div style={{display:"flex",gap:10}}>
+          {Object.entries(MODES).map(([k,v])=>(
+            <button key={k} onClick={e=>{e.stopPropagation();switchMode(k)}} style={{...S.modeBtn,borderColor:mode===k?v.accent:"rgba(255,255,255,0.08)",background:mode===k?v.accent+"20":"rgba(255,255,255,0.03)",color:mode===k?v.accent:"#556"}}>
+              <div style={{width:5,height:5,borderRadius:"50%",background:mode===k?v.accent:"#444",marginBottom:4}} />
+              {v.name.toUpperCase()}
+            </button>
+          ))}
+        </div>
+        <button onClick={e=>{e.stopPropagation();stopAudio()}} style={S.stopBtn}>STOP</button>
+      </div>
+      {showUI&&<div style={S.tapHint}>tap to toggle controls</div>}
+    </div>);
+}
+
+const S={
+  root:{position:"fixed",inset:0,background:"#0A0D14",overflow:"hidden",userSelect:"none",WebkitUserSelect:"none"},
+  canvas:{position:"absolute",inset:0,width:"100%",height:"100%"},
+  landing:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",padding:"40px 24px",textAlign:"center"},
+  tag:{fontFamily:"'Azeret Mono',monospace",fontSize:9,letterSpacing:4,color:"#556",marginBottom:12},
+  title:{fontFamily:"'Instrument Serif',serif",fontSize:52,fontWeight:400,color:"#E8E4DE",margin:0,lineHeight:1.1},
+  desc:{fontFamily:"'Azeret Mono',monospace",fontSize:12,lineHeight:1.8,color:"#667",maxWidth:300,margin:"16px auto 0",fontWeight:300},
+  modePill:{display:"flex",flexDirection:"column",alignItems:"center",padding:"14px 18px 12px",borderRadius:12,border:"1px solid",cursor:"pointer",fontFamily:"'Azeret Mono',monospace",transition:"all .4s ease",background:"none",minWidth:130},
+  beginBtn:{fontFamily:"'Instrument Serif',serif",fontSize:20,color:"#E8E4DE",background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:50,padding:"14px 56px",cursor:"pointer",letterSpacing:3,transition:"all .3s ease"},
+  note:{fontSize:10,color:"#445",marginTop:14,fontFamily:"'Azeret Mono',monospace"},
+  error:{color:"#C07070",fontSize:11,marginBottom:16,maxWidth:280,lineHeight:1.6,fontFamily:"'Azeret Mono',monospace"},
+  modeLabel:{position:"absolute",top:36,left:0,right:0,textAlign:"center",pointerEvents:"none",transition:"opacity .6s ease"},
+  controls:{position:"absolute",bottom:0,left:0,right:0,padding:"50px 20px 36px",background:"linear-gradient(to top,rgba(8,10,16,0.88) 0%,transparent 100%)",display:"flex",flexDirection:"column",alignItems:"center",gap:14,transition:"opacity .4s ease,transform .4s ease"},
+  modeBtn:{display:"flex",flexDirection:"column",alignItems:"center",padding:"10px 20px 8px",borderRadius:10,border:"1px solid",cursor:"pointer",fontFamily:"'Azeret Mono',monospace",fontSize:10,letterSpacing:1.5,transition:"all .35s ease",background:"none"},
+  stopBtn:{fontFamily:"'Azeret Mono',monospace",fontSize:9,letterSpacing:3,color:"#556",background:"none",border:"1px solid rgba(255,255,255,0.06)",borderRadius:20,padding:"7px 24px",cursor:"pointer"},
+  tapHint:{position:"absolute",bottom:8,left:0,right:0,textAlign:"center",fontSize:8,color:"#2A2D34",letterSpacing:1,pointerEvents:"none",fontFamily:"'Azeret Mono',monospace"},
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Soundscape />);
+</script>
+</body>
+</html>

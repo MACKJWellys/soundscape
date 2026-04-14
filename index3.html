@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="theme-color" content="#0A0D14"/>
+<title>Lucid</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>"/>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Azeret+Mono:wght@300;400&display=swap" rel="stylesheet"/>
+<style>*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}html,body,#root{width:100%;height:100%;overflow:hidden;background:#0A0D14}body{-webkit-tap-highlight-color:transparent}</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://unpkg.com/tone@14/build/Tone.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useRef,useCallback}=React;
+
+/* ═══════════════════════════════════════════════════════════
+   LUCID v3 — Sustained generative patterns
+   
+   Architecture: Resonator bank → cascading long delays with
+   cross-coupling → moment phrase scheduler that replays
+   captured material 5 times over 12s at varying pitch/direction.
+   
+   A single bird chirp should create 30+ seconds of evolving
+   layered patterns that slowly darken and fade.
+   ═══════════════════════════════════════════════════════════ */
+
+const PENTA = [
+  130.81,146.83,164.81,196,220,
+  261.63,293.66,329.63,392,440,
+  523.25,587.33,659.25,784,880,
+  1046.5,1174.66,1318.51,1568,1760,
+];
+const NOTE_GRP = [0,1,2,3,4, 0,1,2,3,4, 0,1,2,3,4, 0,1,2,3,4];
+
+function mkDel(ctx, time, fb, lp) {
+  const d = ctx.createDelay(8); d.delayTime.value = time;
+  const g = ctx.createGain(); g.gain.value = fb;
+  const f = ctx.createBiquadFilter(); f.type = "lowpass"; f.frequency.value = lp; f.Q.value = 0.4;
+  const inp = ctx.createGain(); const out = ctx.createGain();
+  inp.connect(d); d.connect(out); d.connect(f); f.connect(g); g.connect(d);
+  return { inp, out, d, g, f };
+}
+
+function mkStars(n) {
+  const s = []; let seed = 77;
+  const r = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  for (let i = 0; i < n; i++) s.push({ x: r(), y: r(), sz: 0.3 + r() * 1.5, sp: 0.2 + r() * 1.8, ph: r() * Math.PI * 2 });
+  return s;
+}
+const STARS = mkStars(90);
+
+const MODES = {
+  lucid: { name: "Lucid", sub: "The world becomes music", accent: "#D4A574", rgb: "212,165,116", bg: "#0A0D14" },
+  liminal: { name: "Liminal", sub: "Moments fold in on themselves", accent: "#7B9DB8", rgb: "123,157,184", bg: "#060D1A" },
+};
+
+function Lucid() {
+  const [started, setStarted] = useState(false);
+  const [mode, setMode] = useState("lucid");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [showUI, setShowUI] = useState(true);
+  const [vis, setVis] = useState({ energy: 0, pool: 0 });
+
+  const canvasRef = useRef(null);
+  const animRef = useRef(null);
+  const streamRef = useRef(null);
+  const sharedRef = useRef(null);
+  const engineRef = useRef(null);
+  const tRef = useRef(0);
+  const energyRef = useRef(0);
+  const modeRef = useRef("lucid");
+
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+
+  /* ── Shared: mic → hpf → comp → adaptive gain ───────── */
+  const buildShared = useCallback((ctx) => {
+    const hpf = ctx.createBiquadFilter(); hpf.type = "highpass"; hpf.frequency.value = 70;
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -24; comp.ratio.value = 3; comp.attack.value = 0.003; comp.release.value = 0.15;
+    const adaptGain = ctx.createGain(); adaptGain.gain.value = 1;
+    const rawAn = ctx.createAnalyser(); rawAn.fftSize = 1024; rawAn.smoothingTimeConstant = 0.7;
+    const outAn = ctx.createAnalyser(); outAn.fftSize = 512; outAn.smoothingTimeConstant = 0.75;
+    const master = ctx.createGain(); master.gain.value = 0.82;
+    const lim = ctx.createDynamicsCompressor();
+    lim.threshold.value = -3; lim.ratio.value = 20; lim.attack.value = 0.001; lim.release.value = 0.05;
+    adaptGain.connect(rawAn); master.connect(outAn); master.connect(lim); lim.connect(ctx.destination);
+    return { hpf, comp, adaptGain, rawAn, outAn, master, lim,
+      rawWave: new Float32Array(rawAn.fftSize), outWave: new Float32Array(outAn.fftSize),
+      outFFT: new Float32Array(outAn.frequencyBinCount), adaptLevel: 1 };
+  }, []);
+
+  /* ══════════════════════════════════════════════════════
+     LUCID ENGINE
+     Resonators → cascading delays → moment phrases
+     ══════════════════════════════════════════════════════ */
+  const buildLucid = useCallback((ctx, input, output) => {
+    // ─── Resonator bank ───
+    const resoSum = ctx.createGain(); resoSum.gain.value = 1;
+    const resonators = PENTA.map((freq, i) => {
+      const bp = ctx.createBiquadFilter(); bp.type = "bandpass";
+      bp.frequency.value = freq; bp.Q.value = 16 + (i / 20) * 14;
+      const g = ctx.createGain();
+      g.gain.value = i < 5 ? 0.08 : i < 10 ? 0.065 : i < 15 ? 0.05 : 0.038;
+      input.connect(bp); bp.connect(g); g.connect(resoSum);
+      return { bp, g, base: g.gain.value };
+    });
+
+    // ─── Chorus for width ───
+    const chorus = new Tone.Chorus({ frequency: 0.6, delayTime: 3.5, depth: 0.5, wet: 0.3 }); chorus.start();
+    const bridgeIn = Tone.getContext().createGain(); resoSum.connect(bridgeIn);
+    const toneIn = new Tone.Gain(1); Tone.connect(bridgeIn, toneIn); toneIn.connect(chorus);
+    const chorusOut = ctx.createGain(); Tone.connect(chorus, chorusOut);
+
+    // ─── 4 cascading long delays with cross-coupling ───
+    // Each delay feeds forward into the next, creating cascading echoes.
+    // A single sound ripples through all 4 delay lines over 12+ seconds.
+    const dlA = mkDel(ctx, 1.2,  0.52, 2200);  // warm, still bright
+    const dlB = mkDel(ctx, 2.3,  0.48, 1600);  // mellowing
+    const dlC = mkDel(ctx, 3.7,  0.42, 1100);  // dark
+    const dlD = mkDel(ctx, 5.5,  0.35, 750);   // very dark, deep
+
+    // Primary input to all delays (weighted)
+    chorusOut.connect(dlA.inp);
+    const bIn = ctx.createGain(); bIn.gain.value = 0.4;
+    chorusOut.connect(bIn); bIn.connect(dlB.inp);
+    const cIn = ctx.createGain(); cIn.gain.value = 0.15;
+    chorusOut.connect(cIn); cIn.connect(dlC.inp);
+
+    // Cross-coupling: A→B, B→C, C→D (cascade creates evolving patterns)
+    const abX = ctx.createGain(); abX.gain.value = 0.12;
+    dlA.out.connect(abX); abX.connect(dlB.inp);
+    const bcX = ctx.createGain(); bcX.gain.value = 0.09;
+    dlB.out.connect(bcX); bcX.connect(dlC.inp);
+    const cdX = ctx.createGain(); cdX.gain.value = 0.07;
+    dlC.out.connect(cdX); cdX.connect(dlD.inp);
+
+    // Direct resonator signal
+    const directG = ctx.createGain(); directG.gain.value = 0.55;
+    chorusOut.connect(directG);
+
+    // Tiny dry signal
+    const dryG = ctx.createGain(); dryG.gain.value = 0.02;
+    input.connect(dryG);
+
+    // ─── Reverb ───
+    const reverbIn = new Tone.Gain(1);
+    Tone.connect(directG, reverbIn);
+    Tone.connect(dlA.out, reverbIn);
+    Tone.connect(dlB.out, reverbIn);
+    Tone.connect(dlC.out, reverbIn);
+    Tone.connect(dlD.out, reverbIn);
+    Tone.connect(dryG, reverbIn);
+    const reverb = new Tone.Freeverb({ roomSize: 0.84, dampening: 2800, wet: 0.45 });
+    reverbIn.connect(reverb);
+
+    // Moment output → reverb too
+    const momentOut = ctx.createGain(); momentOut.gain.value = 0.5;
+    Tone.connect(momentOut, reverbIn);
+
+    Tone.connect(reverb, output);
+
+    // ─── Moment capture ───
+    const capAn = ctx.createAnalyser(); capAn.fftSize = 32768; // ~740ms at 44.1kHz
+    capAn.smoothingTimeConstant = 0;
+    resoSum.connect(capAn);
+    const capBuf = new Float32Array(capAn.fftSize);
+
+    const pool = []; // { buffer, rev, capturedAt, phraseActive }
+    const MAX_POOL = 8;
+    let lastCapture = 0;
+    let prevRMS = 0;
+    const activeSources = [];
+
+    // ─── Schedule a moment PHRASE: 5 plays over ~14 seconds ───
+    function scheduleMomentPhrase(m) {
+      const plays = [
+        { delay: 0.05, pitch: 1.0,  rev: false, vol: 0.32, lp: 4500 },
+        { delay: 2.5,  pitch: 0.84, rev: false, vol: 0.25, lp: 3200 }, // -3 semitones
+        { delay: 5.2,  pitch: 1.0,  rev: true,  vol: 0.20, lp: 2600 }, // reversed
+        { delay: 8.5,  pitch: 1.12, rev: false, vol: 0.15, lp: 2000 }, // +2 semitones
+        { delay: 12.0, pitch: 0.71, rev: true,  vol: 0.09, lp: 1400 }, // reversed, -5 semi
+      ];
+
+      const ct = ctx.currentTime;
+      for (const p of plays) {
+        const src = ctx.createBufferSource();
+        src.buffer = p.rev ? m.rev : m.buffer;
+        src.playbackRate.value = p.pitch;
+        // Occasional glide (20% chance)
+        if (Math.random() < 0.2) {
+          const dir = Math.random() > 0.5 ? 1 : -1;
+          const dur = src.buffer.duration / p.pitch;
+          src.playbackRate.linearRampToValueAtTime(
+            p.pitch + dir * 0.12, ct + p.delay + dur
+          );
+        }
+        const env = ctx.createGain();
+        const dur = src.buffer.duration / p.pitch;
+        const start = ct + p.delay;
+        env.gain.setValueAtTime(0, start);
+        env.gain.linearRampToValueAtTime(p.vol, start + 0.05);
+        if (dur > 0.25) {
+          env.gain.setValueAtTime(p.vol, start + dur - 0.18);
+          env.gain.linearRampToValueAtTime(0, start + dur);
+        }
+        const pan = ctx.createStereoPanner();
+        pan.pan.value = (Math.random() - 0.5) * 1.4;
+        const filt = ctx.createBiquadFilter(); filt.type = "lowpass"; filt.frequency.value = p.lp;
+        src.connect(filt); filt.connect(env); env.connect(pan); pan.connect(momentOut);
+        src.start(start);
+        activeSources.push(src);
+        src.onended = () => {
+          try { src.disconnect(); env.disconnect(); pan.disconnect(); filt.disconnect(); } catch(e) {}
+          const idx = activeSources.indexOf(src); if (idx > -1) activeSources.splice(idx, 1);
+        };
+      }
+      m.phraseActive = true;
+      setTimeout(() => { m.phraseActive = false; }, 14000);
+    }
+
+    return {
+      pool, capAn, capBuf,
+      update(t, dt, rawRMS) {
+        const ct = ctx.currentTime;
+
+        // ─── LFO modulation of resonators ───
+        const weights = [
+          0.5 + 0.5 * Math.sin(t * 0.031 * Math.PI * 2),
+          0.5 + 0.5 * Math.sin(t * 0.031 * Math.PI * 2 + 1.26),
+          0.5 + 0.5 * Math.sin(t * 0.019 * Math.PI * 2 + 0.4),
+          0.5 + 0.5 * Math.sin(t * 0.019 * Math.PI * 2 + 2.51),
+          0.5 + 0.5 * Math.sin(t * 0.013 * Math.PI * 2 + 1.8),
+        ];
+        const octTilt = 0.5 + 0.5 * Math.sin(t * 0.011 * Math.PI * 2);
+        const octW = [1.2 - octTilt * 0.5, 1, 0.8 + octTilt * 0.4, 0.6 + octTilt * 0.6];
+        for (let i = 0; i < resonators.length; i++) {
+          resonators[i].g.gain.setTargetAtTime(
+            resonators[i].base * weights[NOTE_GRP[i]] * octW[Math.floor(i / 5)], ct, 0.15
+          );
+        }
+
+        // ─── Delay time drift ───
+        const l1 = Math.sin(t * 0.029 * Math.PI * 2);
+        const l2 = Math.sin(t * 0.019 * Math.PI * 2);
+        const l3 = Math.sin(t * 0.013 * Math.PI * 2);
+        dlA.d.delayTime.setTargetAtTime(1.2 + l1 * 0.06, ct, 0.8);
+        dlB.d.delayTime.setTargetAtTime(2.3 + l2 * 0.08, ct, 0.8);
+        dlC.d.delayTime.setTargetAtTime(3.7 + l3 * 0.1, ct, 0.8);
+        dlD.d.delayTime.setTargetAtTime(5.5 + l1 * 0.15, ct, 0.8);
+
+        // ─── Delay feedback breath (density aware) ───
+        const sparsity = Math.max(0.5, 1.3 - rawRMS * 6);
+        dlA.g.gain.setTargetAtTime(0.50 * sparsity + l1 * 0.03, ct, 0.3);
+        dlB.g.gain.setTargetAtTime(0.46 * sparsity + l2 * 0.03, ct, 0.3);
+        dlC.g.gain.setTargetAtTime(0.40 * sparsity, ct, 0.3);
+        dlD.g.gain.setTargetAtTime(0.33 * sparsity, ct, 0.3);
+
+        // Filter brightness drift
+        dlA.f.frequency.setTargetAtTime(2200 + l2 * 400, ct, 0.5);
+        dlB.f.frequency.setTargetAtTime(1600 + l3 * 300, ct, 0.5);
+
+        // ─── Moment capture (on novelty) ───
+        const rmsD = rawRMS - prevRMS; prevRMS = rawRMS;
+        const isOnset = rmsD > 0.006 && rawRMS > 0.012;
+        const capGap = t - lastCapture;
+
+        if (isOnset && capGap > 6 && t > 3) {
+          capAn.getFloatTimeDomainData(capBuf);
+          let capE = 0;
+          for (let i = 0; i < capBuf.length; i++) capE += capBuf[i] * capBuf[i];
+          capE = Math.sqrt(capE / capBuf.length);
+
+          if (capE > 0.003) {
+            const ab = ctx.createBuffer(1, capBuf.length, ctx.sampleRate);
+            ab.copyToChannel(new Float32Array(capBuf), 0);
+            const rb = ctx.createBuffer(1, capBuf.length, ctx.sampleRate);
+            const rd = rb.getChannelData(0), fd = ab.getChannelData(0);
+            for (let i = 0; i < fd.length; i++) rd[i] = fd[fd.length - 1 - i];
+
+            const moment = { buffer: ab, rev: rb, capturedAt: t, phraseActive: false };
+            pool.push(moment);
+            if (pool.length > MAX_POOL) {
+              // Remove oldest non-active moment
+              const inactive = pool.filter(m => !m.phraseActive);
+              if (inactive.length > 0) {
+                inactive.sort((a, b) => a.capturedAt - b.capturedAt);
+                pool.splice(pool.indexOf(inactive[0]), 1);
+              } else {
+                pool.shift();
+              }
+            }
+
+            // Schedule the phrase immediately
+            scheduleMomentPhrase(moment);
+            lastCapture = t;
+          }
+        }
+
+        // ─── Re-trigger old moments occasionally ───
+        if (pool.length > 1 && Math.random() < 0.0008) {
+          const inactive = pool.filter(m => !m.phraseActive);
+          if (inactive.length > 0) {
+            const pick = inactive[Math.floor(Math.random() * inactive.length)];
+            scheduleMomentPhrase(pick);
+          }
+        }
+      },
+      cleanup() {
+        activeSources.forEach(s => { try { s.stop(); s.disconnect(); } catch(e) {} });
+        resonators.forEach(r => { try { r.bp.disconnect(); r.g.disconnect(); } catch(e) {} });
+        [dlA, dlB, dlC, dlD].forEach(d => {
+          try { d.inp.disconnect(); d.out.disconnect(); d.d.disconnect(); d.g.disconnect(); d.f.disconnect(); } catch(e) {}
+        });
+        [resoSum, bridgeIn, chorusOut, directG, dryG, bIn, cIn, abX, bcX, cdX, momentOut, capAn].forEach(n => {
+          try { n.disconnect(); } catch(e) {}
+        });
+        [chorus, toneIn, reverbIn, reverb].forEach(n => { try { n.dispose(); } catch(e) {} });
+        pool.length = 0;
+      },
+    };
+  }, []);
+
+  /* ══════════════════════════════════════════════════════
+     LIMINAL ENGINE
+     Palindromic decay + long cascading delays
+     ══════════════════════════════════════════════════════ */
+  const buildLiminal = useCallback((ctx, input, output) => {
+    const inputLP = ctx.createBiquadFilter(); inputLP.type = "lowpass"; inputLP.frequency.value = 4000;
+    input.connect(inputLP);
+
+    // Long cascading delays for sustained echoes of palindromes
+    const dlA = mkDel(ctx, 1.6, 0.45, 1800);
+    const dlB = mkDel(ctx, 3.2, 0.38, 1200);
+    const abX = ctx.createGain(); abX.gain.value = 0.1;
+    dlA.out.connect(abX); abX.connect(dlB.inp);
+
+    const capAn = ctx.createAnalyser(); capAn.fftSize = 32768; capAn.smoothingTimeConstant = 0;
+    inputLP.connect(capAn);
+    const capBuf = new Float32Array(capAn.fftSize);
+
+    const ambG = ctx.createGain(); ambG.gain.value = 0.05;
+    inputLP.connect(ambG);
+    const phaser = new Tone.Phaser({ frequency: 0.1, octaves: 2.5, baseFrequency: 600, wet: 0.4 });
+    const reverb = new Tone.Freeverb({ roomSize: 0.93, dampening: 1600, wet: 0.6 });
+    Tone.connect(ambG, phaser); phaser.connect(reverb);
+
+    const palOut = ctx.createGain(); palOut.gain.value = 0.6;
+    palOut.connect(dlA.inp); // palindromes feed into delay cascade
+    Tone.connect(palOut, reverb);
+    Tone.connect(dlA.out, reverb);
+    Tone.connect(dlB.out, reverb);
+    Tone.connect(reverb, output);
+
+    const dryG = ctx.createGain(); dryG.gain.value = 0.02;
+    input.connect(dryG); Tone.connect(dryG, output);
+
+    let lastPal = -5, prevRMS = 0;
+    const activeSources = [];
+
+    function trigPal() {
+      capAn.getFloatTimeDomainData(capBuf);
+      let e = 0; for (let i = 0; i < capBuf.length; i++) e += capBuf[i] * capBuf[i];
+      if (Math.sqrt(e / capBuf.length) < 0.002) return;
+
+      const fwd = ctx.createBuffer(1, capBuf.length, ctx.sampleRate);
+      fwd.copyToChannel(new Float32Array(capBuf), 0);
+      const rev = ctx.createBuffer(1, capBuf.length, ctx.sampleRate);
+      const rd = rev.getChannelData(0), fd = fwd.getChannelData(0);
+      for (let i = 0; i < fd.length; i++) rd[i] = fd[fd.length - 1 - i];
+
+      const dur = fwd.duration, gap = dur * 0.12, ct = ctx.currentTime;
+      const echoes = [
+        { buf: fwd, at: ct + 0.02, vol: 0.40, lp: 5000 },
+        { buf: rev, at: ct + dur + gap, vol: 0.30, lp: 3500 },
+        { buf: fwd, at: ct + (dur + gap) * 2, vol: 0.22, lp: 2400 },
+        { buf: rev, at: ct + (dur + gap) * 3, vol: 0.14, lp: 1600 },
+        { buf: fwd, at: ct + (dur + gap) * 4, vol: 0.07, lp: 1000 },
+        { buf: rev, at: ct + (dur + gap) * 5, vol: 0.03, lp: 600 },
+      ];
+      for (const ec of echoes) {
+        const src = ctx.createBufferSource(); src.buffer = ec.buf;
+        src.playbackRate.value = 0.97 + Math.random() * 0.06;
+        const env = ctx.createGain(), d = ec.buf.duration / src.playbackRate.value;
+        env.gain.setValueAtTime(0, ec.at);
+        env.gain.linearRampToValueAtTime(ec.vol, ec.at + 0.035);
+        if (d > 0.15) { env.gain.setValueAtTime(ec.vol, ec.at + d - 0.12); env.gain.linearRampToValueAtTime(0, ec.at + d); }
+        const filt = ctx.createBiquadFilter(); filt.type = "lowpass"; filt.frequency.value = ec.lp;
+        const pan = ctx.createStereoPanner(); pan.pan.value = (Math.random() - 0.5) * 0.8;
+        src.connect(filt); filt.connect(env); env.connect(pan); pan.connect(palOut);
+        src.start(ec.at); activeSources.push(src);
+        src.onended = () => { try { src.disconnect(); env.disconnect(); filt.disconnect(); pan.disconnect(); } catch(e) {} const idx = activeSources.indexOf(src); if (idx > -1) activeSources.splice(idx, 1); };
+      }
+    }
+
+    return {
+      pool: null,
+      update(t, dt, rawRMS) {
+        const rmsD = rawRMS - prevRMS; prevRMS = rawRMS;
+        if (rmsD > 0.005 && rawRMS > 0.01 && (t - lastPal) > 4.5) { trigPal(); lastPal = t; }
+        const ct = ctx.currentTime, l = Math.sin(t * 0.017 * Math.PI * 2);
+        inputLP.frequency.setTargetAtTime(3200 + l * 1000, ct, 0.5);
+        dlA.d.delayTime.setTargetAtTime(1.6 + l * 0.08, ct, 0.8);
+      },
+      cleanup() {
+        activeSources.forEach(s => { try { s.stop(); s.disconnect(); } catch(e) {} });
+        [inputLP, ambG, palOut, dryG, capAn, abX].forEach(n => { try { n.disconnect(); } catch(e) {} });
+        [dlA, dlB].forEach(d => { try { d.inp.disconnect(); d.out.disconnect(); d.d.disconnect(); d.g.disconnect(); d.f.disconnect(); } catch(e) {} });
+        [phaser, reverb].forEach(n => { try { n.dispose(); } catch(e) {} });
+      },
+    };
+  }, []);
+
+  /* ── Start / Stop / Switch ───────────────────────────── */
+  const startAudio = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      await Tone.start(); Tone.getDestination().volume.value = -60;
+      const ctx = Tone.getContext().rawContext;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+      streamRef.current = stream;
+      const mic = ctx.createMediaStreamSource(stream);
+      const shared = buildShared(ctx); sharedRef.current = shared;
+      mic.connect(shared.hpf); shared.hpf.connect(shared.comp); shared.comp.connect(shared.adaptGain);
+      engineRef.current = (modeRef.current === "lucid" ? buildLucid : buildLiminal)(ctx, shared.adaptGain, shared.master);
+      tRef.current = 0; setStarted(true);
+    } catch (err) {
+      const m = err.message || "";
+      setError(m.includes("Permission") || m.includes("NotAllowed") ? "Microphone access needed." : "Could not start: " + m);
+    }
+    setLoading(false);
+  }, [buildShared, buildLucid, buildLiminal]);
+
+  const stopAudio = useCallback(() => {
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+    if (engineRef.current) { engineRef.current.cleanup(); engineRef.current = null; }
+    const s = sharedRef.current;
+    if (s) { [s.hpf, s.comp, s.adaptGain, s.rawAn, s.outAn, s.master, s.lim].forEach(n => { try { n.disconnect(); } catch(e) {} }); sharedRef.current = null; }
+    if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+    setStarted(false);
+  }, []);
+
+  const switchMode = useCallback((nm) => {
+    if (!started || nm === modeRef.current) return; setMode(nm);
+    const ctx = Tone.getContext().rawContext, s = sharedRef.current; if (!s) return;
+    s.master.gain.setTargetAtTime(0, ctx.currentTime, 0.2);
+    setTimeout(() => {
+      if (engineRef.current) engineRef.current.cleanup();
+      engineRef.current = (nm === "lucid" ? buildLucid : buildLiminal)(ctx, s.adaptGain, s.master);
+      tRef.current = 0; s.master.gain.setTargetAtTime(0.82, ctx.currentTime, 0.5);
+    }, 500);
+  }, [started, buildLucid, buildLiminal]);
+
+  /* ── Main loop ───────────────────────────────────────── */
+  useEffect(() => {
+    if (!started) return;
+    const canvas = canvasRef.current; if (!canvas) return;
+    const c = canvas.getContext("2d");
+    const resize = () => { const dpr = window.devicePixelRatio || 1, r = canvas.getBoundingClientRect(); canvas.width = r.width * dpr; canvas.height = r.height * dpr; c.setTransform(dpr, 0, 0, dpr, 0, 0); };
+    resize(); window.addEventListener("resize", resize);
+
+    const draw = () => {
+      animRef.current = requestAnimationFrame(draw);
+      const s = sharedRef.current, eng = engineRef.current; if (!s || !eng) return;
+      const rect = canvas.getBoundingClientRect(), w = rect.width, h = rect.height;
+      const dt = 0.016; tRef.current += dt; const t = tRef.current;
+      const m = modeRef.current, md = MODES[m];
+      const rawCtx = Tone.getContext().rawContext;
+
+      // Adaptive gain
+      s.rawAn.getFloatTimeDomainData(s.rawWave);
+      let rS = 0; for (let i = 0; i < s.rawWave.length; i++) rS += s.rawWave[i] * s.rawWave[i];
+      const rawRMS = Math.sqrt(rS / s.rawWave.length);
+      const tG = Math.min(5, 0.1 / Math.max(rawRMS, 0.003));
+      const gA = tG > s.adaptLevel ? 0.005 : 0.002;
+      s.adaptLevel += gA * (tG - s.adaptLevel);
+      s.adaptGain.gain.setTargetAtTime(Math.max(0.5, Math.min(s.adaptLevel, 5.5)), rawCtx.currentTime, 0.1);
+
+      eng.update(t, dt, rawRMS);
+
+      // Output energy
+      s.outAn.getFloatTimeDomainData(s.outWave);
+      let oS = 0; for (let i = 0; i < s.outWave.length; i++) oS += s.outWave[i] * s.outWave[i];
+      energyRef.current += (Math.sqrt(oS / s.outWave.length) - energyRef.current) * 0.06;
+      const en = Math.min(1, energyRef.current * 3.5);
+      s.outAn.getFloatFrequencyData(s.outFFT);
+      setVis({ energy: en, pool: eng.pool ? eng.pool.length : 0 });
+
+      // ═══ Canvas ═══
+      c.fillStyle = md.bg; c.fillRect(0, 0, w, h);
+      const bg = c.createRadialGradient(w * 0.5, h * 0.4, 0, w * 0.5, h * 0.4, Math.max(w, h) * 0.7);
+      bg.addColorStop(0, "rgba(30,25,20,0.12)"); bg.addColorStop(1, "transparent");
+      c.fillStyle = bg; c.fillRect(0, 0, w, h);
+
+      for (const star of STARS) {
+        c.globalAlpha = (0.2 + 0.3 * Math.sin(t * star.sp + star.ph) + en * 0.3) * 0.5;
+        c.fillStyle = m === "lucid" ? "#E8D5C0" : "#C0D0E0";
+        c.beginPath(); c.arc(star.x * w, star.y * h, star.sz * (0.6 + en * 0.6), 0, Math.PI * 2); c.fill();
+      }
+      c.globalAlpha = 1;
+
+      const cx = w / 2, cy = h * 0.42, baseR = Math.min(w, h) * 0.14;
+
+      if (m === "lucid") {
+        // Aurora bands
+        for (let b = 0; b < 5; b++) {
+          const bandY = cy - baseR + (b / 5) * baseR * 2.2;
+          const amp = 5 + en * 30 + Math.sin(t * 0.2 + b * 1.1) * 5;
+          const hue = (28 + b * 14 + Math.sin(t * 0.015 + b) * 18) % 360;
+          c.beginPath();
+          for (let x = 0; x <= w; x += 3) {
+            const y = bandY + Math.sin(x * 0.006 + t * 0.18 + b * 1.5) * amp + Math.sin(x * 0.012 + t * 0.12 + b * 2.3) * amp * 0.4;
+            x === 0 ? c.moveTo(x, y) : c.lineTo(x, y);
+          }
+          for (let x = w; x >= 0; x -= 3) {
+            const y = bandY + 14 + Math.sin(x * 0.006 + t * 0.18 + b * 1.5 + 0.5) * amp + Math.sin(x * 0.012 + t * 0.12 + b * 2.3 + 0.3) * amp * 0.4;
+            c.lineTo(x, y);
+          }
+          c.closePath();
+          c.fillStyle = `hsla(${hue},${35 + en * 30}%,${40 + en * 24}%,${0.03 + en * 0.05})`;
+          c.fill();
+        }
+
+        // Pool orbs
+        if (eng.pool) {
+          for (let i = 0; i < eng.pool.length; i++) {
+            const mi = eng.pool[i];
+            const angle = (i / Math.max(eng.pool.length, 1)) * Math.PI * 2 + t * 0.025;
+            const orbit = baseR * (1.1 + i * 0.1);
+            const px = cx + Math.cos(angle) * orbit, py = cy + Math.sin(angle) * orbit;
+            const active = mi.phraseActive;
+            const sz = active ? 3.5 + Math.sin(t * 6) * 1.5 : 1.8;
+            const al = active ? 0.6 : 0.2;
+            c.beginPath(); c.arc(px, py, sz, 0, Math.PI * 2);
+            c.fillStyle = `rgba(${md.rgb},${al})`;
+            if (active) { c.shadowBlur = 18; c.shadowColor = md.accent; }
+            c.fill(); c.shadowBlur = 0;
+          }
+        }
+
+        // Resonator dots
+        for (let i = 0; i < 20; i++) {
+          const bin = Math.floor((PENTA[i] / 2000) * s.outFFT.length);
+          const act = Math.max(0, ((s.outFFT[Math.min(bin, s.outFFT.length - 1)] || -100) + 75) / 75);
+          if (act < 0.04) continue;
+          const angle = (i / 20) * Math.PI * 2 + t * 0.035 + Math.sin(t * 0.009 + i) * 0.3;
+          const orbit = baseR * (0.55 + (i % 5) * 0.14) + act * 16;
+          c.beginPath(); c.arc(cx + Math.cos(angle) * orbit, cy + Math.sin(angle) * orbit, 1 + act * 3.5, 0, Math.PI * 2);
+          c.fillStyle = `rgba(${md.rgb},${act * 0.6})`; c.shadowBlur = act * 10; c.shadowColor = md.accent; c.fill(); c.shadowBlur = 0;
+        }
+      } else {
+        // Liminal: concentric ripples
+        for (let r = 0; r < 10; r++) {
+          const phase = (t * 0.05 + r / 10) % 1;
+          const radius = baseR * 0.2 + phase * baseR * 2.8;
+          const alpha = (1 - phase) * (0.05 + en * 0.12);
+          if (alpha < 0.01) continue;
+          c.beginPath();
+          for (let i = 0; i <= 80; i++) {
+            const a = (i / 80) * Math.PI * 2;
+            const wob = Math.sin(a * 3 + t * 0.3 + r) * 3 * en + Math.sin(a * 5 + t * 0.18 + r * 2) * 2 * en;
+            c.lineTo(cx + Math.cos(a) * (radius + wob), cy + Math.sin(a) * (radius + wob));
+          }
+          c.closePath(); c.strokeStyle = `rgba(${md.rgb},${alpha})`; c.lineWidth = 1; c.stroke();
+        }
+        const gR = baseR * (0.35 + en * 0.4);
+        const glow = c.createRadialGradient(cx, cy, 0, cx, cy, gR);
+        glow.addColorStop(0, `rgba(${md.rgb},${0.06 + en * 0.1})`); glow.addColorStop(1, "transparent");
+        c.fillStyle = glow; c.beginPath(); c.arc(cx, cy, gR, 0, Math.PI * 2); c.fill();
+      }
+
+      // Central glow
+      const glowR = baseR * (0.65 + en * 0.55);
+      const cGlow = c.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+      cGlow.addColorStop(0, `rgba(${md.rgb},${0.05 + en * 0.1})`);
+      cGlow.addColorStop(0.5, `rgba(${md.rgb},${0.012 + en * 0.03})`);
+      cGlow.addColorStop(1, "transparent");
+      c.fillStyle = cGlow; c.fillRect(cx - glowR, cy - glowR, glowR * 2, glowR * 2);
+
+      // Vignette
+      const vig = c.createRadialGradient(cx, h * 0.45, Math.min(w, h) * 0.25, cx, h * 0.45, Math.max(w, h) * 0.8);
+      vig.addColorStop(0, "transparent"); vig.addColorStop(1, "rgba(0,0,0,0.5)");
+      c.fillStyle = vig; c.fillRect(0, 0, w, h);
+    };
+    draw();
+    return () => { cancelAnimationFrame(animRef.current); window.removeEventListener("resize", resize); };
+  }, [started]);
+
+  useEffect(() => () => stopAudio(), [stopAudio]);
+
+  const md = MODES[mode];
+  if (!started) {
+    return (
+      <div style={S.root}>
+        <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Azeret+Mono:wght@300;400&display=swap" rel="stylesheet" />
+        <div style={S.landing}>
+          <div style={{ marginBottom: 56 }}>
+            <div style={S.tag}>GENERATIVE AUDIO</div>
+            <h1 style={S.title}>Lucid</h1>
+            <p style={S.desc}>Your environment, resynthesized into a living composition. Put on headphones — the world around you becomes the instrument.</p>
+          </div>
+          <div style={{ display: "flex", gap: 12, marginBottom: 48 }}>
+            {Object.entries(MODES).map(([k, v]) => (
+              <button key={k} onClick={() => setMode(k)} style={{ ...S.pill, borderColor: mode === k ? v.accent : "rgba(255,255,255,0.08)", background: mode === k ? v.accent + "18" : "rgba(255,255,255,0.03)", color: mode === k ? v.accent : "#667" }}>
+                <div style={{ width: 6, height: 6, borderRadius: "50%", background: mode === k ? v.accent : "#444", marginBottom: 5 }} />
+                <div style={{ fontSize: 11, letterSpacing: 1.5 }}>{v.name.toUpperCase()}</div>
+                <div style={{ fontSize: 9, color: mode === k ? v.accent + "AA" : "#445", marginTop: 3 }}>{v.sub}</div>
+              </button>
+            ))}
+          </div>
+          {error && <p style={S.error}>{error}</p>}
+          <button onClick={startAudio} disabled={loading} style={{ ...S.begin, opacity: loading ? 0.5 : 1 }}>{loading ? "Listening..." : "Begin"}</button>
+          <p style={S.note}>🎧 Headphones required</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.root} onClick={() => setShowUI(u => !u)}>
+      <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Azeret+Mono:wght@300;400&display=swap" rel="stylesheet" />
+      <canvas ref={canvasRef} style={S.canvas} />
+      <div style={{ ...S.label, opacity: showUI ? 1 : 0 }}>
+        <div style={{ fontSize: 9, letterSpacing: 3, color: md.accent, marginBottom: 3 }}>{md.name.toUpperCase()}</div>
+        <div style={{ fontFamily: "'Instrument Serif', serif", fontSize: 24, color: "#E8E4DE" }}>{md.sub}</div>
+        {vis.pool > 0 && <div style={{ fontSize: 9, color: "#445", marginTop: 6 }}>{vis.pool} moments in memory</div>}
+      </div>
+      <div style={{ ...S.ctrls, opacity: showUI ? 1 : 0, transform: showUI ? "none" : "translateY(16px)", pointerEvents: showUI ? "auto" : "none" }}>
+        <div style={{ display: "flex", gap: 10 }}>
+          {Object.entries(MODES).map(([k, v]) => (
+            <button key={k} onClick={e => { e.stopPropagation(); switchMode(k); }} style={{ ...S.mBtn, borderColor: mode === k ? v.accent : "rgba(255,255,255,0.08)", background: mode === k ? v.accent + "20" : "rgba(255,255,255,0.03)", color: mode === k ? v.accent : "#556" }}>
+              <div style={{ width: 5, height: 5, borderRadius: "50%", background: mode === k ? v.accent : "#444", marginBottom: 4 }} />{v.name.toUpperCase()}</button>
+          ))}
+        </div>
+        <button onClick={e => { e.stopPropagation(); stopAudio(); }} style={S.stop}>STOP</button>
+      </div>
+      {showUI && <div style={S.hint}>tap to toggle</div>}
+    </div>
+  );
+}
+
+const S = {
+  root: { position: "fixed", inset: 0, background: "#0A0D14", overflow: "hidden", userSelect: "none", WebkitUserSelect: "none" },
+  canvas: { position: "absolute", inset: 0, width: "100%", height: "100%" },
+  landing: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", padding: "40px 24px", textAlign: "center" },
+  tag: { fontFamily: "'Azeret Mono', monospace", fontSize: 9, letterSpacing: 4, color: "#556", marginBottom: 12 },
+  title: { fontFamily: "'Instrument Serif', serif", fontSize: 56, fontWeight: 400, color: "#E8E4DE", margin: 0, lineHeight: 1.1 },
+  desc: { fontFamily: "'Azeret Mono', monospace", fontSize: 12, lineHeight: 1.8, color: "#667", maxWidth: 300, margin: "16px auto 0", fontWeight: 300 },
+  pill: { display: "flex", flexDirection: "column", alignItems: "center", padding: "14px 18px 12px", borderRadius: 12, border: "1px solid", cursor: "pointer", fontFamily: "'Azeret Mono', monospace", transition: "all 0.4s ease", background: "none", minWidth: 130 },
+  begin: { fontFamily: "'Instrument Serif', serif", fontSize: 20, color: "#E8E4DE", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 50, padding: "14px 56px", cursor: "pointer", letterSpacing: 3 },
+  note: { fontSize: 10, color: "#445", marginTop: 14, fontFamily: "'Azeret Mono', monospace" },
+  error: { color: "#C07070", fontSize: 11, marginBottom: 16, maxWidth: 280, lineHeight: 1.6, fontFamily: "'Azeret Mono', monospace" },
+  label: { position: "absolute", top: 36, left: 0, right: 0, textAlign: "center", pointerEvents: "none", transition: "opacity 0.6s ease", fontFamily: "'Azeret Mono', monospace" },
+  ctrls: { position: "absolute", bottom: 0, left: 0, right: 0, padding: "50px 20px 36px", background: "linear-gradient(to top, rgba(8,10,16,0.88) 0%, transparent 100%)", display: "flex", flexDirection: "column", alignItems: "center", gap: 14, transition: "opacity 0.4s ease, transform 0.4s ease" },
+  mBtn: { display: "flex", flexDirection: "column", alignItems: "center", padding: "10px 20px 8px", borderRadius: 10, border: "1px solid", cursor: "pointer", fontFamily: "'Azeret Mono', monospace", fontSize: 10, letterSpacing: 1.5, transition: "all 0.35s ease", background: "none" },
+  stop: { fontFamily: "'Azeret Mono', monospace", fontSize: 9, letterSpacing: 3, color: "#556", background: "none", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, padding: "7px 24px", cursor: "pointer" },
+  hint: { position: "absolute", bottom: 8, left: 0, right: 0, textAlign: "center", fontSize: 8, color: "#2A2D34", letterSpacing: 1, pointerEvents: "none", fontFamily: "'Azeret Mono', monospace" },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Lucid/>);
+</script>
+</body>
+</html>
